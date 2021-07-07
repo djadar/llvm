@@ -4,29 +4,46 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+using namespace std;
 using namespace llvm;
+
+
 namespace {
+
 	struct Danger : public FunctionPass {
 	//std::map<std::string, int> danger;
 	static char ID;
 	Danger() : FunctionPass(ID) {}
+
+	/*std::string identification(BasicBlock::iterator *i){
+		std::string s;
+		if(llvm::isa<llvm::GetElementPtrInst>(*i) && llvm::isa<llvm::StoreInst>((*i)->getNextNode())){
+					s = "Dereferencement en écriture. ";
+
+				}else if(llvm::isa<llvm::GetElementPtrInst>(*i) && llvm::isa<llvm::LoadInst>(++(*i))){
+					s = "Dereferencement en lecture. ";
+
+				}
+	}*/
+
 	virtual bool runOnFunction(Function &F) {
 		errs() << "Function " << F.getName() << '\n';
 		for (Function::iterator bb = F.begin(), e = F.end(); bb != e; ++bb) {
+			std::string s;
 			for (BasicBlock::iterator i = bb->begin(), e = bb->end(); i != e; ++i) {
-				//errs() << "Une instruction " << i->getOpcodeName()<< '\n';
-				//BasicBlock::iterator j = i + 1;
+				
+				s = i->getOpcodeName();
 				if(llvm::isa<llvm::GetElementPtrInst>(i) && llvm::isa<llvm::StoreInst>(i->getNextNode())){
-					errs() << "Dereferencement en écriture trouvé !!!\n ";
+					s = "Dereferencement en écriture. ";
+
+				}else if(llvm::isa<llvm::GetElementPtrInst>(i) && llvm::isa<llvm::LoadInst>(i->getNextNode())){
+					s = "Dereferencement en lecture. ";
+
 				}
-				/*if(llvm::isa<llvm::GetElementPtrInst>(i) && llvm::isa<llvm::LoadInst>(++i)){
-					errs() << "Dereferencement en lecture trouvé !!!\n ";
-				}*/
-				/*if(danger.find(i->getOpcodeName()) == danger.end()) {
-					danger[i->getOpcodeName()] = 1;
-				} else {
-					danger[i->getOpcodeName()] += 1;
-				}*/
+				
+				errs() << "L'opération sur pointeur est :" << s << "\n";
+				
+
 
 			}
 		}
