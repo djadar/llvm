@@ -8,4 +8,7 @@ add_subdirectory(Vectorize)
 add_subdirectory(Hello)
 add_subdirectory(ObjCARC)
 add_subdirectory(Coroutines)
+add_subdirectory(CFGuard)
 add_subdirectory(Danger)
+add_subdirectory(Memoire)
+

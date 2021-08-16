@@ -22,20 +22,21 @@
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
-#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LoopIterator.h"
 #include "llvm/Analysis/ScalarEvolution.h"
-#include "llvm/Analysis/ScalarEvolutionExpander.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/Transforms/Utils/UnrollLoop.h"
 #include <algorithm>
 
@@ -49,6 +50,9 @@ static cl::opt<bool> UnrollRuntimeMultiExit(
     "unroll-runtime-multi-exit", cl::init(false), cl::Hidden,
     cl::desc("Allow runtime unrolling for loops with multiple exits, when "
              "epilog is generated"));
+static cl::opt<bool> UnrollRuntimeOtherExitPredictable(
+    "unroll-runtime-other-exit-predictable", cl::init(false), cl::Hidden,
+    cl::desc("Assume the non latch exit block to be predictable"));
 
 /// Connect the unrolling prolog code to the original loop.
 /// The unrolling prolog code contains code to execute the
@@ -395,9 +399,9 @@ CloneLoopBlocks(Loop *L, Value *NewIter, const bool CreateRemainderLoop,
     }
   }
   if (CreateRemainderLoop) {
-    Loop *NewLoop = NewLoops[L];
-    MDNode *LoopID = NewLoop->getLoopID();
+    Loop *NewLoop = NewLoops[L];  
     assert(NewLoop && "L should have been cloned");
+    MDNode *LoopID = NewLoop->getLoopID();
 
     // Only add loop metadata if the loop is not going to be completely
     // unrolled.
@@ -432,6 +436,7 @@ static bool canSafelyUnrollMultiExitLoop(Loop *L, BasicBlock *LatchExit,
   // loop. Check for these below.
 
   // We rely on LCSSA form being preserved when the exit blocks are transformed.
+  // (Note that only an off-by-default mode of the old PM disables PreserveLCCA.)
   if (!PreserveLCSSA)
     return false;
 
@@ -492,17 +497,82 @@ static bool canProfitablyUnrollMultiExitLoop(
   if (ExitingBlocks.size() > 2)
     return false;
 
+  // Allow unrolling of loops with no non latch exit blocks.
+  if (OtherExits.size() == 0)
+    return true;
+
   // The second heuristic is that L has one exit other than the latchexit and
   // that exit is a deoptimize block. We know that deoptimize blocks are rarely
   // taken, which also implies the branch leading to the deoptimize block is
-  // highly predictable.
+  // highly predictable. When UnrollRuntimeOtherExitPredictable is specified, we
+  // assume the other exit branch is predictable even if it has no deoptimize
+  // call.
   return (OtherExits.size() == 1 &&
-          OtherExits[0]->getTerminatingDeoptimizeCall());
+          (UnrollRuntimeOtherExitPredictable ||
+           OtherExits[0]->getTerminatingDeoptimizeCall()));
   // TODO: These can be fine-tuned further to consider code size or deopt states
   // that are captured by the deoptimize exit block.
   // Also, we can extend this to support more cases, if we actually
   // know of kinds of multiexit loops that would benefit from unrolling.
 }
+
+// Assign the maximum possible trip count as the back edge weight for the
+// remainder loop if the original loop comes with a branch weight.
+static void updateLatchBranchWeightsForRemainderLoop(Loop *OrigLoop,
+                                                     Loop *RemainderLoop,
+                                                     uint64_t UnrollFactor) {
+  uint64_t TrueWeight, FalseWeight;
+  BranchInst *LatchBR =
+      cast<BranchInst>(OrigLoop->getLoopLatch()->getTerminator());
+  if (LatchBR->extractProfMetadata(TrueWeight, FalseWeight)) {
+    uint64_t ExitWeight = LatchBR->getSuccessor(0) == OrigLoop->getHeader()
+                              ? FalseWeight
+                              : TrueWeight;
+    assert(UnrollFactor > 1);
+    uint64_t BackEdgeWeight = (UnrollFactor - 1) * ExitWeight;
+    BasicBlock *Header = RemainderLoop->getHeader();
+    BasicBlock *Latch = RemainderLoop->getLoopLatch();
+    auto *RemainderLatchBR = cast<BranchInst>(Latch->getTerminator());
+    unsigned HeaderIdx = (RemainderLatchBR->getSuccessor(0) == Header ? 0 : 1);
+    MDBuilder MDB(RemainderLatchBR->getContext());
+    MDNode *WeightNode =
+        HeaderIdx ? MDB.createBranchWeights(ExitWeight, BackEdgeWeight)
+                  : MDB.createBranchWeights(BackEdgeWeight, ExitWeight);
+    RemainderLatchBR->setMetadata(LLVMContext::MD_prof, WeightNode);
+  }
+}
+
+/// Calculate ModVal = (BECount + 1) % Count on the abstract integer domain
+/// accounting for the possibility of unsigned overflow in the 2s complement
+/// domain. Preconditions:
+/// 1) TripCount = BECount + 1 (allowing overflow)
+/// 2) Log2(Count) <= BitWidth(BECount)
+static Value *CreateTripRemainder(IRBuilder<> &B, Value *BECount,
+                                  Value *TripCount, unsigned Count) {
+  // Note that TripCount is BECount + 1.
+  if (isPowerOf2_32(Count))
+    // If the expression is zero, then either:
+    //  1. There are no iterations to be run in the prolog/epilog loop.
+    // OR
+    //  2. The addition computing TripCount overflowed.
+    //
+    // If (2) is true, we know that TripCount really is (1 << BEWidth) and so
+    // the number of iterations that remain to be run in the original loop is a
+    // multiple Count == (1 << Log2(Count)) because Log2(Count) <= BEWidth (a
+    // precondition of this method).
+    return B.CreateAnd(TripCount, Count - 1, "xtraiter");
+
+  // As (BECount + 1) can potentially unsigned overflow we count
+  // (BECount % Count) + 1 which is overflow safe as BECount % Count < Count.
+  Constant *CountC = ConstantInt::get(BECount->getType(), Count);
+  Value *ModValTmp = B.CreateURem(BECount, CountC);
+  Value *ModValAdd = B.CreateAdd(ModValTmp,
+                                 ConstantInt::get(ModValTmp->getType(), 1));
+  // At that point (BECount % Count) + 1 could be equal to Count.
+  // To handle this case we need to take mod by Count one more time.
+  return B.CreateURem(ModValAdd, CountC, "xtraiter");
+}
+
 
 /// Insert code in the prolog/epilog code when unrolling a loop with a
 /// run-time trip-count.
@@ -542,13 +612,11 @@ static bool canProfitablyUnrollMultiExitLoop(
 ///        if (extraiters != 0) jump Epil: // Omitted if unroll factor is 2.
 /// EpilExit:
 
-bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
-                                      bool AllowExpensiveTripCount,
-                                      bool UseEpilogRemainder,
-                                      bool UnrollRemainder, bool ForgetAllSCEV,
-                                      LoopInfo *LI, ScalarEvolution *SE,
-                                      DominatorTree *DT, AssumptionCache *AC,
-                                      bool PreserveLCSSA, Loop **ResultLoop) {
+bool llvm::UnrollRuntimeLoopRemainder(
+    Loop *L, unsigned Count, bool AllowExpensiveTripCount,
+    bool UseEpilogRemainder, bool UnrollRemainder, bool ForgetAllSCEV,
+    LoopInfo *LI, ScalarEvolution *SE, DominatorTree *DT, AssumptionCache *AC,
+    const TargetTransformInfo *TTI, bool PreserveLCSSA, Loop **ResultLoop) {
   LLVM_DEBUG(dbgs() << "Trying runtime unrolling on Loop: \n");
   LLVM_DEBUG(L->dump());
   LLVM_DEBUG(UseEpilogRemainder ? dbgs() << "Using epilog remainder.\n"
@@ -624,6 +692,7 @@ bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
   unsigned BEWidth = cast<IntegerType>(BECountSC->getType())->getBitWidth();
 
   // Add 1 since the backedge count doesn't include the first loop iteration.
+  // (Note that overflow can occur, this is handled explicitly below)
   const SCEV *TripCountSC =
       SE->getAddExpr(BECountSC, SE->getConstant(BECountSC->getType(), 1));
   if (isa<SCEVCouldNotCompute>(TripCountSC)) {
@@ -636,7 +705,8 @@ bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
   const DataLayout &DL = Header->getModule()->getDataLayout();
   SCEVExpander Expander(*SE, DL, "loop-unroll");
   if (!AllowExpensiveTripCount &&
-      Expander.isHighCostExpansion(TripCountSC, L, PreHeaderBR)) {
+      Expander.isHighCostExpansion(TripCountSC, L, SCEVCheapExpansionBudget,
+                                   TTI, PreHeaderBR)) {
     LLVM_DEBUG(dbgs() << "High cost for expanding trip count scev!\n");
     return false;
   }
@@ -715,35 +785,8 @@ bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
   Value *BECount = Expander.expandCodeFor(BECountSC, BECountSC->getType(),
                                           PreHeaderBR);
   IRBuilder<> B(PreHeaderBR);
-  Value *ModVal;
-  // Calculate ModVal = (BECount + 1) % Count.
-  // Note that TripCount is BECount + 1.
-  if (isPowerOf2_32(Count)) {
-    // When Count is power of 2 we don't BECount for epilog case, however we'll
-    // need it for a branch around unrolling loop for prolog case.
-    ModVal = B.CreateAnd(TripCount, Count - 1, "xtraiter");
-    //  1. There are no iterations to be run in the prolog/epilog loop.
-    // OR
-    //  2. The addition computing TripCount overflowed.
-    //
-    // If (2) is true, we know that TripCount really is (1 << BEWidth) and so
-    // the number of iterations that remain to be run in the original loop is a
-    // multiple Count == (1 << Log2(Count)) because Log2(Count) <= BEWidth (we
-    // explicitly check this above).
-  } else {
-    // As (BECount + 1) can potentially unsigned overflow we count
-    // (BECount % Count) + 1 which is overflow safe as BECount % Count < Count.
-    Value *ModValTmp = B.CreateURem(BECount,
-                                    ConstantInt::get(BECount->getType(),
-                                                     Count));
-    Value *ModValAdd = B.CreateAdd(ModValTmp,
-                                   ConstantInt::get(ModValTmp->getType(), 1));
-    // At that point (BECount % Count) + 1 could be equal to Count.
-    // To handle this case we need to take mod by Count one more time.
-    ModVal = B.CreateURem(ModValAdd,
-                          ConstantInt::get(BECount->getType(), Count),
-                          "xtraiter");
-  }
+  Value * const ModVal = CreateTripRemainder(B, BECount, TripCount, Count);
+
   Value *BranchVal =
       UseEpilogRemainder ? B.CreateICmpULT(BECount,
                                            ConstantInt::get(BECount->getType(),
@@ -788,6 +831,11 @@ bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
       InsertTop, InsertBot,
       NewPreHeader, NewBlocks, LoopBlocks, VMap, DT, LI);
 
+  // Assign the maximum possible trip count as the back edge weight for the
+  // remainder loop if the original loop comes with a branch weight.
+  if (remainderLoop && !UnrollRemainder)
+    updateLatchBranchWeightsForRemainderLoop(L, remainderLoop, Count);
+
   // Insert the cloned blocks into the function.
   F->getBasicBlockList().splice(InsertBot->getIterator(),
                                 F->getBasicBlockList(),
@@ -799,29 +847,20 @@ bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
   // work is to update the phi nodes in the original loop, and take in the
   // values from the cloned region.
   for (auto *BB : OtherExits) {
-   for (auto &II : *BB) {
-
-     // Given we preserve LCSSA form, we know that the values used outside the
-     // loop will be used through these phi nodes at the exit blocks that are
-     // transformed below.
-     if (!isa<PHINode>(II))
-       break;
-     PHINode *Phi = cast<PHINode>(&II);
-     unsigned oldNumOperands = Phi->getNumIncomingValues();
+    // Given we preserve LCSSA form, we know that the values used outside the
+    // loop will be used through these phi nodes at the exit blocks that are
+    // transformed below.
+    for (PHINode &PN : BB->phis()) {
+     unsigned oldNumOperands = PN.getNumIncomingValues();
      // Add the incoming values from the remainder code to the end of the phi
      // node.
-     for (unsigned i =0; i < oldNumOperands; i++){
-       Value *newVal = VMap.lookup(Phi->getIncomingValue(i));
-       // newVal can be a constant or derived from values outside the loop, and
-       // hence need not have a VMap value. Also, since lookup already generated
-       // a default "null" VMap entry for this value, we need to populate that
-       // VMap entry correctly, with the mapped entry being itself.
-       if (!newVal) {
-         newVal = Phi->getIncomingValue(i);
-         VMap[Phi->getIncomingValue(i)] = Phi->getIncomingValue(i);
-       }
-       Phi->addIncoming(newVal,
-                           cast<BasicBlock>(VMap[Phi->getIncomingBlock(i)]));
+     for (unsigned i = 0; i < oldNumOperands; i++){
+       auto *PredBB =PN.getIncomingBlock(i);
+       auto *V = PN.getIncomingValue(i);
+       if (Instruction *I = dyn_cast<Instruction>(V))
+         if (L->contains(I))
+           V = VMap.lookup(I);
+       PN.addIncoming(V, cast<BasicBlock>(VMap[PredBB]));
      }
    }
 #if defined(EXPENSIVE_CHECKS) && !defined(NDEBUG)
@@ -848,7 +887,7 @@ bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
     // dominator of the exit blocks.
     for (auto *BB : L->blocks()) {
       auto *DomNodeBB = DT->getNode(BB);
-      for (auto *DomChild : DomNodeBB->getChildren()) {
+      for (auto *DomChild : DomNodeBB->children()) {
         auto *DomChildBB = DomChild->getBlock();
         if (!L->contains(LI->getLoopFor(DomChildBB)))
           ChildrenToUpdate.push_back(DomChildBB);
@@ -943,12 +982,10 @@ bool llvm::UnrollRuntimeLoopRemainder(Loop *L, unsigned Count,
     LLVM_DEBUG(dbgs() << "Unrolling remainder loop\n");
     UnrollResult =
         UnrollLoop(remainderLoop,
-                   {/*Count*/ Count - 1, /*TripCount*/ Count - 1,
-                    /*Force*/ false, /*AllowRuntime*/ false,
-                    /*AllowExpensiveTripCount*/ false, /*PreserveCondBr*/ true,
-                    /*PreserveOnlyFirst*/ false, /*TripMultiple*/ 1,
-                    /*PeelCount*/ 0, /*UnrollRemainder*/ false, ForgetAllSCEV},
-                   LI, SE, DT, AC, /*ORE*/ nullptr, PreserveLCSSA);
+                   {/*Count*/ Count - 1, /*Force*/ false, /*Runtime*/ false,
+                    /*AllowExpensiveTripCount*/ false,
+                    /*UnrollRemainder*/ false, ForgetAllSCEV},
+                   LI, SE, DT, AC, TTI, /*ORE*/ nullptr, PreserveLCSSA);
   }
 
   if (ResultLoop && UnrollResult != LoopUnrollResult::FullyUnrolled)

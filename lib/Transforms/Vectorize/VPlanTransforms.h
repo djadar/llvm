@@ -1,4 +1,4 @@
-//===- VPlanHCFGTransforms.h - Utility VPlan to VPlan transforms ----------===//
+//===- VPlanTransforms.h - Utility VPlan to VPlan transforms --------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -10,26 +10,30 @@
 /// This file provides utility VPlan to VPlan transformations.
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_TRANSFORMS_VECTORIZE_VPLANHCFGTRANSFORMS_H
-#define LLVM_TRANSFORMS_VECTORIZE_VPLANHCFGTRANSFORMS_H
+#ifndef LLVM_TRANSFORMS_VECTORIZE_VPLANTRANSFORMS_H
+#define LLVM_TRANSFORMS_VECTORIZE_VPLANTRANSFORMS_H
 
 #include "VPlan.h"
-#include "llvm/IR/Instruction.h"
 #include "llvm/Transforms/Vectorize/LoopVectorizationLegality.h"
 
 namespace llvm {
 
-class VPlanHCFGTransforms {
+class Instruction;
+class ScalarEvolution;
 
-public:
+struct VPlanTransforms {
   /// Replaces the VPInstructions in \p Plan with corresponding
   /// widen recipes.
   static void VPInstructionsToVPRecipes(
-      VPlanPtr &Plan,
-      LoopVectorizationLegality::InductionList *Inductions,
-      SmallPtrSetImpl<Instruction *> &DeadInstructions);
+      Loop *OrigLoop, VPlanPtr &Plan,
+      LoopVectorizationLegality::InductionList &Inductions,
+      SmallPtrSetImpl<Instruction *> &DeadInstructions, ScalarEvolution &SE);
+
+  static bool sinkScalarOperands(VPlan &Plan);
+
+  static bool mergeReplicateRegions(VPlan &Plan);
 };
 
 } // namespace llvm
 
-#endif // LLVM_TRANSFORMS_VECTORIZE_VPLANHCFGTRANSFORMS_H
+#endif // LLVM_TRANSFORMS_VECTORIZE_VPLANTRANSFORMS_H

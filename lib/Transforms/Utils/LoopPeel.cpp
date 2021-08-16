@@ -1,4 +1,4 @@
-//===- UnrollLoopPeel.cpp - Loop peeling utilities ------------------------===//
+//===- LoopPeel.cpp -------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,12 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file implements some loop unrolling utilities for peeling loops
-// with dynamically inferred (from PGO) trip counts. See LoopUnroll.cpp for
-// unrolling loops with compile-time constant trip counts.
-//
+// Loop Peeling Utilities.
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Transforms/Utils/LoopPeel.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallVector.h"
@@ -49,9 +47,23 @@
 using namespace llvm;
 using namespace llvm::PatternMatch;
 
-#define DEBUG_TYPE "loop-unroll"
+#define DEBUG_TYPE "loop-peel"
 
 STATISTIC(NumPeeled, "Number of loops peeled");
+
+static cl::opt<unsigned> UnrollPeelCount(
+    "unroll-peel-count", cl::Hidden,
+    cl::desc("Set the unroll peeling count, for testing purposes"));
+
+static cl::opt<bool>
+    UnrollAllowPeeling("unroll-allow-peeling", cl::init(true), cl::Hidden,
+                       cl::desc("Allows loops to be peeled when the dynamic "
+                                "trip count is known to be low."));
+
+static cl::opt<bool>
+    UnrollAllowLoopNestsPeeling("unroll-allow-loop-nests-peeling",
+                                cl::init(false), cl::Hidden,
+                                cl::desc("Allows loop nests to be peeled."));
 
 static cl::opt<unsigned> UnrollPeelMaxCount(
     "unroll-peel-max-count", cl::init(7), cl::Hidden,
@@ -103,7 +115,12 @@ bool llvm::canPeel(Loop *L) {
   // This can be an indication of two different things:
   // 1) The loop is not rotated.
   // 2) The loop contains irreducible control flow that involves the latch.
-  if (L->getLoopLatch() != L->getExitingBlock())
+  const BasicBlock *Latch = L->getLoopLatch();
+  if (Latch != L->getExitingBlock())
+    return false;
+
+  // Peeling is only supported if the latch is a branch.
+  if (!isa<BranchInst>(Latch->getTerminator()))
     return false;
 
   return true;
@@ -194,9 +211,7 @@ static unsigned countToEliminateCompares(Loop &L, unsigned MaxPeelCount,
 
     // Do not consider predicates that are known to be true or false
     // independently of the loop iteration.
-    if (SE.isKnownPredicate(Pred, LeftSCEV, RightSCEV) ||
-        SE.isKnownPredicate(ICmpInst::getInversePredicate(Pred), LeftSCEV,
-                            RightSCEV))
+    if (SE.evaluatePredicate(Pred, LeftSCEV, RightSCEV))
       continue;
 
     // Check if we have a condition with one AddRec and one non AddRec
@@ -212,17 +227,12 @@ static unsigned countToEliminateCompares(Loop &L, unsigned MaxPeelCount,
     const SCEVAddRecExpr *LeftAR = cast<SCEVAddRecExpr>(LeftSCEV);
 
     // Avoid huge SCEV computations in the loop below, make sure we only
-    // consider AddRecs of the loop we are trying to peel and avoid
-    // non-monotonic predicates, as we will not be able to simplify the loop
-    // body.
-    // FIXME: For the non-monotonic predicates ICMP_EQ and ICMP_NE we can
-    //        simplify the loop, if we peel 1 additional iteration, if there
-    //        is no wrapping.
-    bool Increasing;
-    if (!LeftAR->isAffine() || LeftAR->getLoop() != &L ||
-        !SE.isMonotonicPredicate(LeftAR, Pred, Increasing))
+    // consider AddRecs of the loop we are trying to peel.
+    if (!LeftAR->isAffine() || LeftAR->getLoop() != &L)
       continue;
-    (void)Increasing;
+    if (!(ICmpInst::isEquality(Pred) && LeftAR->hasNoSelfWrap()) &&
+        !SE.getMonotonicPredicateType(LeftAR, Pred))
+      continue;
 
     // Check if extending the current DesiredPeelCount lets us evaluate Pred
     // or !Pred in the loop body statically.
@@ -238,18 +248,42 @@ static unsigned countToEliminateCompares(Loop &L, unsigned MaxPeelCount,
       Pred = ICmpInst::getInversePredicate(Pred);
 
     const SCEV *Step = LeftAR->getStepRecurrence(SE);
-    while (NewPeelCount < MaxPeelCount &&
-           SE.isKnownPredicate(Pred, IterVal, RightSCEV)) {
-      IterVal = SE.getAddExpr(IterVal, Step);
+    const SCEV *NextIterVal = SE.getAddExpr(IterVal, Step);
+    auto PeelOneMoreIteration = [&IterVal, &NextIterVal, &SE, Step,
+                                 &NewPeelCount]() {
+      IterVal = NextIterVal;
+      NextIterVal = SE.getAddExpr(IterVal, Step);
       NewPeelCount++;
+    };
+
+    auto CanPeelOneMoreIteration = [&NewPeelCount, &MaxPeelCount]() {
+      return NewPeelCount < MaxPeelCount;
+    };
+
+    while (CanPeelOneMoreIteration() &&
+           SE.isKnownPredicate(Pred, IterVal, RightSCEV))
+      PeelOneMoreIteration();
+
+    // With *that* peel count, does the predicate !Pred become known in the
+    // first iteration of the loop body after peeling?
+    if (!SE.isKnownPredicate(ICmpInst::getInversePredicate(Pred), IterVal,
+                             RightSCEV))
+      continue; // If not, give up.
+
+    // However, for equality comparisons, that isn't always sufficient to
+    // eliminate the comparsion in loop body, we may need to peel one more
+    // iteration. See if that makes !Pred become unknown again.
+    if (ICmpInst::isEquality(Pred) &&
+        !SE.isKnownPredicate(ICmpInst::getInversePredicate(Pred), NextIterVal,
+                             RightSCEV) &&
+        !SE.isKnownPredicate(Pred, IterVal, RightSCEV) &&
+        SE.isKnownPredicate(Pred, NextIterVal, RightSCEV)) {
+      if (!CanPeelOneMoreIteration())
+        continue; // Need to peel one more iteration, but can't. Give up.
+      PeelOneMoreIteration(); // Great!
     }
 
-    // Only peel the loop if the monotonic predicate !Pred becomes known in the
-    // first iteration of the loop body after peeling.
-    if (NewPeelCount > DesiredPeelCount &&
-        SE.isKnownPredicate(ICmpInst::getInversePredicate(Pred), IterVal,
-                            RightSCEV))
-      DesiredPeelCount = NewPeelCount;
+    DesiredPeelCount = std::max(DesiredPeelCount, NewPeelCount);
   }
 
   return DesiredPeelCount;
@@ -257,18 +291,21 @@ static unsigned countToEliminateCompares(Loop &L, unsigned MaxPeelCount,
 
 // Return the number of iterations we want to peel off.
 void llvm::computePeelCount(Loop *L, unsigned LoopSize,
-                            TargetTransformInfo::UnrollingPreferences &UP,
-                            unsigned &TripCount, ScalarEvolution &SE) {
+                            TargetTransformInfo::PeelingPreferences &PP,
+                            unsigned &TripCount, ScalarEvolution &SE,
+                            unsigned Threshold) {
   assert(LoopSize > 0 && "Zero loop size is not allowed!");
-  // Save the UP.PeelCount value set by the target in
-  // TTI.getUnrollingPreferences or by the flag -unroll-peel-count.
-  unsigned TargetPeelCount = UP.PeelCount;
-  UP.PeelCount = 0;
+  // Save the PP.PeelCount value set by the target in
+  // TTI.getPeelingPreferences or by the flag -unroll-peel-count.
+  unsigned TargetPeelCount = PP.PeelCount;
+  PP.PeelCount = 0;
   if (!canPeel(L))
     return;
 
-  // Only try to peel innermost loops.
-  if (!L->empty())
+  // Only try to peel innermost loops by default.
+  // The constraint can be relaxed by the target in TTI.getUnrollingPreferences
+  // or by the flag -unroll-allow-loop-nests-peeling.
+  if (!PP.AllowLoopNestsPeeling && !L->isInnermost())
     return;
 
   // If the user provided a peel count, use that.
@@ -276,13 +313,13 @@ void llvm::computePeelCount(Loop *L, unsigned LoopSize,
   if (UserPeelCount) {
     LLVM_DEBUG(dbgs() << "Force-peeling first " << UnrollForcePeelCount
                       << " iterations.\n");
-    UP.PeelCount = UnrollForcePeelCount;
-    UP.PeelProfiledIterations = true;
+    PP.PeelCount = UnrollForcePeelCount;
+    PP.PeelProfiledIterations = true;
     return;
   }
 
   // Skip peeling if it's disabled.
-  if (!UP.AllowPeeling)
+  if (!PP.AllowPeeling)
     return;
 
   unsigned AlreadyPeeled = 0;
@@ -298,7 +335,7 @@ void llvm::computePeelCount(Loop *L, unsigned LoopSize,
   // maximum number of iterations among these values, thus turning all those
   // Phis into invariants.
   // First, check that we can peel at least one iteration.
-  if (2 * LoopSize <= UP.Threshold && UnrollPeelMaxCount > 0) {
+  if (2 * LoopSize <= Threshold && UnrollPeelMaxCount > 0) {
     // Store the pre-calculated values here.
     SmallDenseMap<PHINode *, unsigned> IterationsToInvariance;
     // Now go through all Phis to calculate their the number of iterations they
@@ -318,7 +355,7 @@ void llvm::computePeelCount(Loop *L, unsigned LoopSize,
 
     // Pay respect to limitations implied by loop size and the max peel count.
     unsigned MaxPeelCount = UnrollPeelMaxCount;
-    MaxPeelCount = std::min(MaxPeelCount, UP.Threshold / LoopSize - 1);
+    MaxPeelCount = std::min(MaxPeelCount, Threshold / LoopSize - 1);
 
     DesiredPeelCount = std::max(DesiredPeelCount,
                                 countToEliminateCompares(*L, MaxPeelCount, SE));
@@ -331,8 +368,8 @@ void llvm::computePeelCount(Loop *L, unsigned LoopSize,
         LLVM_DEBUG(dbgs() << "Peel " << DesiredPeelCount
                           << " iteration(s) to turn"
                           << " some Phis into invariants.\n");
-        UP.PeelCount = DesiredPeelCount;
-        UP.PeelProfiledIterations = false;
+        PP.PeelCount = DesiredPeelCount;
+        PP.PeelProfiledIterations = false;
         return;
       }
     }
@@ -344,7 +381,7 @@ void llvm::computePeelCount(Loop *L, unsigned LoopSize,
     return;
 
   // Do not apply profile base peeling if it is disabled.
-  if (!UP.PeelProfiledIterations)
+  if (!PP.PeelProfiledIterations)
     return;
   // If we don't know the trip count, but have reason to believe the average
   // trip count is low, peeling should be beneficial, since we will usually
@@ -361,10 +398,10 @@ void llvm::computePeelCount(Loop *L, unsigned LoopSize,
 
     if (*PeelCount) {
       if ((*PeelCount + AlreadyPeeled <= UnrollPeelMaxCount) &&
-          (LoopSize * (*PeelCount + 1) <= UP.Threshold)) {
+          (LoopSize * (*PeelCount + 1) <= Threshold)) {
         LLVM_DEBUG(dbgs() << "Peeling first " << *PeelCount
                           << " iterations.\n");
-        UP.PeelCount = *PeelCount;
+        PP.PeelCount = *PeelCount;
         return;
       }
       LLVM_DEBUG(dbgs() << "Requested peel count: " << *PeelCount << "\n");
@@ -372,7 +409,7 @@ void llvm::computePeelCount(Loop *L, unsigned LoopSize,
       LLVM_DEBUG(dbgs() << "Max peel count: " << UnrollPeelMaxCount << "\n");
       LLVM_DEBUG(dbgs() << "Peel cost: " << LoopSize * (*PeelCount + 1)
                         << "\n");
-      LLVM_DEBUG(dbgs() << "Max peel cost: " << UP.Threshold << "\n");
+      LLVM_DEBUG(dbgs() << "Max peel cost: " << Threshold << "\n");
     }
   }
 }
@@ -467,10 +504,10 @@ static void fixupBranchWeights(BasicBlock *Header, BranchInst *LatchBR,
 /// instructions in the last peeled-off iteration.
 static void cloneLoopBlocks(
     Loop *L, unsigned IterNumber, BasicBlock *InsertTop, BasicBlock *InsertBot,
-    SmallVectorImpl<std::pair<BasicBlock *, BasicBlock *> > &ExitEdges,
+    SmallVectorImpl<std::pair<BasicBlock *, BasicBlock *>> &ExitEdges,
     SmallVectorImpl<BasicBlock *> &NewBlocks, LoopBlocksDFS &LoopBlocks,
     ValueToValueMapTy &VMap, ValueToValueMapTy &LVMap, DominatorTree *DT,
-    LoopInfo *LI) {
+    LoopInfo *LI, ArrayRef<MDNode *> LoopLocalNoAliasDeclScopes) {
   BasicBlock *Header = L->getHeader();
   BasicBlock *Latch = L->getLoopLatch();
   BasicBlock *PreHeader = L->getLoopPreheader();
@@ -486,7 +523,10 @@ static void cloneLoopBlocks(
     BasicBlock *NewBB = CloneBasicBlock(*BB, VMap, ".peel", F);
     NewBlocks.push_back(NewBB);
 
-    if (ParentLoop)
+    // If an original block is an immediate child of the loop L, its copy
+    // is a child of a ParentLoop after peeling. If a block is a child of
+    // a nested loop, it is handled in the cloneLoop() call below.
+    if (ParentLoop && LI->getLoopFor(*BB) == L)
       ParentLoop->addBasicBlockToLoop(NewBB, *LI);
 
     VMap[*BB] = NewBB;
@@ -501,6 +541,21 @@ static void cloneLoopBlocks(
         DT->addNewBlock(NewBB, cast<BasicBlock>(VMap[IDom->getBlock()]));
       }
     }
+  }
+
+  {
+    // Identify what other metadata depends on the cloned version. After
+    // cloning, replace the metadata with the corrected version for both
+    // memory instructions and noalias intrinsics.
+    std::string Ext = (Twine("Peel") + Twine(IterNumber)).str();
+    cloneAndAdaptNoAliasScopes(LoopLocalNoAliasDeclScopes, NewBlocks,
+                               Header->getContext(), Ext);
+  }
+
+  // Recursively create the new Loop objects for nested loops, if any,
+  // to preserve LoopInfo.
+  for (Loop *ChildLoop : *L) {
+    cloneLoop(ChildLoop, ParentLoop, VMap, LI, nullptr);
   }
 
   // Hook-up the control flow for the newly inserted blocks.
@@ -562,8 +617,42 @@ static void cloneLoopBlocks(
 
   // LastValueMap is updated with the values for the current loop
   // which are used the next time this function is called.
-  for (const auto &KV : VMap)
+  for (auto KV : VMap)
     LVMap[KV.first] = KV.second;
+}
+
+TargetTransformInfo::PeelingPreferences llvm::gatherPeelingPreferences(
+    Loop *L, ScalarEvolution &SE, const TargetTransformInfo &TTI,
+    Optional<bool> UserAllowPeeling,
+    Optional<bool> UserAllowProfileBasedPeeling, bool UnrollingSpecficValues) {
+  TargetTransformInfo::PeelingPreferences PP;
+
+  // Set the default values.
+  PP.PeelCount = 0;
+  PP.AllowPeeling = true;
+  PP.AllowLoopNestsPeeling = false;
+  PP.PeelProfiledIterations = true;
+
+  // Get the target specifc values.
+  TTI.getPeelingPreferences(L, SE, PP);
+
+  // User specified values using cl::opt.
+  if (UnrollingSpecficValues) {
+    if (UnrollPeelCount.getNumOccurrences() > 0)
+      PP.PeelCount = UnrollPeelCount;
+    if (UnrollAllowPeeling.getNumOccurrences() > 0)
+      PP.AllowPeeling = UnrollAllowPeeling;
+    if (UnrollAllowLoopNestsPeeling.getNumOccurrences() > 0)
+      PP.AllowLoopNestsPeeling = UnrollAllowLoopNestsPeeling;
+  }
+
+  // User specifed values provided by argument.
+  if (UserAllowPeeling.hasValue())
+    PP.AllowPeeling = *UserAllowPeeling;
+  if (UserAllowProfileBasedPeeling.hasValue())
+    PP.PeelProfiledIterations = *UserAllowProfileBasedPeeling;
+
+  return PP;
 }
 
 /// Peel off the first \p PeelCount iterations of loop \p L.
@@ -576,8 +665,8 @@ static void cloneLoopBlocks(
 /// for the bulk of dynamic execution, can be further simplified by scalar
 /// optimizations.
 bool llvm::peelLoop(Loop *L, unsigned PeelCount, LoopInfo *LI,
-                    ScalarEvolution *SE, DominatorTree *DT,
-                    AssumptionCache *AC, bool PreserveLCSSA) {
+                    ScalarEvolution *SE, DominatorTree *DT, AssumptionCache *AC,
+                    bool PreserveLCSSA) {
   assert(PeelCount > 0 && "Attempt to peel out zero iterations?");
   assert(canPeel(L) && "Attempt to peel a loop which is not peelable?");
 
@@ -687,13 +776,19 @@ bool llvm::peelLoop(Loop *L, unsigned PeelCount, LoopInfo *LI,
   uint64_t ExitWeight = 0, FallThroughWeight = 0;
   initBranchWeights(Header, LatchBR, ExitWeight, FallThroughWeight);
 
+  // Identify what noalias metadata is inside the loop: if it is inside the
+  // loop, the associated metadata must be cloned for each iteration.
+  SmallVector<MDNode *, 6> LoopLocalNoAliasDeclScopes;
+  identifyNoAliasScopesToClone(L->getBlocks(), LoopLocalNoAliasDeclScopes);
+
   // For each peeled-off iteration, make a copy of the loop.
   for (unsigned Iter = 0; Iter < PeelCount; ++Iter) {
     SmallVector<BasicBlock *, 8> NewBlocks;
     ValueToValueMapTy VMap;
 
     cloneLoopBlocks(L, Iter, InsertTop, InsertBot, ExitEdges, NewBlocks,
-                    LoopBlocks, VMap, LVMap, DT, LI);
+                    LoopBlocks, VMap, LVMap, DT, LI,
+                    LoopLocalNoAliasDeclScopes);
 
     // Remap to use values from the current iteration instead of the
     // previous one.

@@ -37,6 +37,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/ProfileData/InstrProf.h"
 #include "llvm/Support/Casting.h"
@@ -56,31 +57,17 @@ using namespace llvm;
 
 #define DEBUG_TYPE "instrprof"
 
-// The start and end values of precise value profile range for memory
-// intrinsic sizes
-cl::opt<std::string> MemOPSizeRange(
-    "memop-size-range",
-    cl::desc("Set the range of size in memory intrinsic calls to be profiled "
-             "precisely, in a format of <start_val>:<end_val>"),
-    cl::init(""));
-
-// The value that considered to be large value in  memory intrinsic.
-cl::opt<unsigned> MemOPSizeLarge(
-    "memop-size-large",
-    cl::desc("Set large value thresthold in memory intrinsic size profiling. "
-             "Value of 0 disables the large value profiling."),
-    cl::init(8192));
-
 namespace {
-
-cl::opt<bool> DoNameCompression("enable-name-compression",
-                                cl::desc("Enable name string compression"),
-                                cl::init(true));
 
 cl::opt<bool> DoHashBasedCounterSplit(
     "hash-based-counter-split",
     cl::desc("Rename counter variable of a comdat function based on cfg hash"),
     cl::init(true));
+
+cl::opt<bool> RuntimeCounterRelocation(
+    "runtime-counter-relocation",
+    cl::desc("Enable relocating counters at runtime."),
+    cl::init(false));
 
 cl::opt<bool> ValueProfileStaticAlloc(
     "vp-static-alloc",
@@ -106,6 +93,12 @@ cl::opt<bool> AtomicCounterUpdatePromoted(
     "atomic-counter-update-promoted", cl::ZeroOrMore,
     cl::desc("Do counter update using atomic fetch add "
              " for promoted counters only"),
+    cl::init(false));
+
+cl::opt<bool> AtomicFirstCounter(
+    "atomic-first-counter", cl::ZeroOrMore,
+    cl::desc("Use atomic fetch add for first counter in a function (usually "
+             "the entry counter)"),
     cl::init(false));
 
 // If the option is not specified, the default behavior about whether
@@ -142,6 +135,10 @@ cl::opt<bool> IterativeCounterPromotion(
     cl::ZeroOrMore, "iterative-counter-promotion", cl::init(true),
     cl::desc("Allow counter promotion across the whole loop nest."));
 
+cl::opt<bool> SkipRetExitBlock(
+    cl::ZeroOrMore, "skip-ret-exit-block", cl::init(true),
+    cl::desc("Suppress counter promotion if exit blocks contain ret."));
+
 class InstrProfilingLegacyPass : public ModulePass {
   InstrProfiling InstrProf;
 
@@ -150,7 +147,9 @@ public:
 
   InstrProfilingLegacyPass() : ModulePass(ID) {}
   InstrProfilingLegacyPass(const InstrProfOptions &Options, bool IsCS = false)
-      : ModulePass(ID), InstrProf(Options, IsCS) {}
+      : ModulePass(ID), InstrProf(Options, IsCS) {
+    initializeInstrProfilingLegacyPassPass(*PassRegistry::getPassRegistry());
+  }
 
   StringRef getPassName() const override {
     return "Frontend instrumentation-based coverage lowering";
@@ -206,6 +205,7 @@ public:
         // automic update currently can only be promoted across the current
         // loop, not the whole loop nest.
         Builder.CreateAtomicRMW(AtomicRMWInst::Add, Addr, LiveInValue,
+                                MaybeAlign(),
                                 AtomicOrdering::SequentiallyConsistent);
       else {
         LoadInst *OldVal = Builder.CreateLoad(Ty, Addr, "pgocount.promoted");
@@ -241,9 +241,14 @@ public:
       : LoopToCandidates(LoopToCands), ExitBlocks(), InsertPts(), L(CurLoop),
         LI(LI), BFI(BFI) {
 
+    // Skip collection of ExitBlocks and InsertPts for loops that will not be
+    // able to have counters promoted.
     SmallVector<BasicBlock *, 8> LoopExitBlocks;
     SmallPtrSet<BasicBlock *, 8> BlockSet;
+
     L.getExitBlocks(LoopExitBlocks);
+    if (!isPromotionPossible(&L, LoopExitBlocks))
+      return;
 
     for (BasicBlock *ExitBlock : LoopExitBlocks) {
       if (BlockSet.insert(ExitBlock).second) {
@@ -257,6 +262,18 @@ public:
     // Skip 'infinite' loops:
     if (ExitBlocks.size() == 0)
       return false;
+
+    // Skip if any of the ExitBlocks contains a ret instruction.
+    // This is to prevent dumping of incomplete profile -- if the
+    // the loop is a long running loop and dump is called in the middle
+    // of the loop, the result profile is incomplete.
+    // FIXME: add other heuristics to detect long running loops.
+    if (SkipRetExitBlock) {
+      for (auto BB : ExitBlocks)
+        if (isa<ReturnInst>(BB->getTerminator()))
+          return false;
+    }
+
     unsigned MaxProm = getMaxNumOfPromotionsInLoop(&L);
     if (MaxProm == 0)
       return false;
@@ -312,21 +329,31 @@ private:
     return true;
   }
 
-  // Returns the max number of Counter Promotions for LP.
-  unsigned getMaxNumOfPromotionsInLoop(Loop *LP) {
+  // Check whether the loop satisfies the basic conditions needed to perform
+  // Counter Promotions.
+  bool isPromotionPossible(Loop *LP,
+                           const SmallVectorImpl<BasicBlock *> &LoopExitBlocks) {
     // We can't insert into a catchswitch.
-    SmallVector<BasicBlock *, 8> LoopExitBlocks;
-    LP->getExitBlocks(LoopExitBlocks);
     if (llvm::any_of(LoopExitBlocks, [](BasicBlock *Exit) {
           return isa<CatchSwitchInst>(Exit->getTerminator());
         }))
-      return 0;
+      return false;
 
     if (!LP->hasDedicatedExits())
-      return 0;
+      return false;
 
     BasicBlock *PH = LP->getLoopPreheader();
     if (!PH)
+      return false;
+
+    return true;
+  }
+
+  // Returns the max number of Counter Promotions for LP.
+  unsigned getMaxNumOfPromotionsInLoop(Loop *LP) {
+    SmallVector<BasicBlock *, 8> LoopExitBlocks;
+    LP->getExitBlocks(LoopExitBlocks);
+    if (!isPromotionPossible(LP, LoopExitBlocks))
       return 0;
 
     SmallVector<BasicBlock *, 8> ExitingBlocks;
@@ -368,6 +395,15 @@ private:
   Loop &L;
   LoopInfo &LI;
   BlockFrequencyInfo *BFI;
+};
+
+enum class ValueProfilingCallType {
+  // Individual values are tracked. Currently used for indiret call target
+  // profiling.
+  Default,
+
+  // MemOp: the memop size value profiling.
+  MemOp
 };
 
 } // end anonymous namespace
@@ -430,6 +466,18 @@ bool InstrProfiling::lowerIntrinsics(Function *F) {
   return true;
 }
 
+bool InstrProfiling::isRuntimeCounterRelocationEnabled() const {
+  // Mach-O don't support weak external references.
+  if (TT.isOSBinFormatMachO())
+    return false;
+
+  if (RuntimeCounterRelocation.getNumOccurrences() > 0)
+    return RuntimeCounterRelocation;
+
+  // Fuchsia uses runtime counter relocation by default.
+  return TT.isOSFuchsia();
+}
+
 bool InstrProfiling::isCounterPromotionEnabled() const {
   if (DoCounterPromotion.getNumOccurrences() > 0)
     return DoCounterPromotion;
@@ -472,6 +520,14 @@ void InstrProfiling::promoteCounterLoadStores(Function *F) {
   }
 }
 
+static bool needsRuntimeHookUnconditionally(const Triple &TT) {
+  // On Fuchsia, we only need runtime hook if any counters are present.
+  if (TT.isOSFuchsia())
+    return false;
+
+  return true;
+}
+
 /// Check if the module contains uses of any profiling intrinsics.
 static bool containsProfilingIntrinsics(Module &M) {
   if (auto *F = M.getFunction(
@@ -496,13 +552,15 @@ bool InstrProfiling::run(
   NamesVar = nullptr;
   NamesSize = 0;
   ProfileDataMap.clear();
+  CompilerUsedVars.clear();
   UsedVars.clear();
-  getMemOPSizeRangeFromOption(MemOPSizeRange, MemOPSizeRangeStart,
-                              MemOPSizeRangeLast);
   TT = Triple(M.getTargetTriple());
 
+  bool MadeChange;
+
   // Emit the runtime hook even if no counters are present.
-  bool MadeChange = emitRuntimeHook();
+  if (needsRuntimeHookUnconditionally(TT))
+    MadeChange = emitRuntimeHook();
 
   // Improve compile time by avoiding linear scans when there is no work.
   GlobalVariable *CoverageNamesVar =
@@ -541,15 +599,16 @@ bool InstrProfiling::run(
 
   emitVNodes();
   emitNameData();
+  emitRuntimeHook();
   emitRegistration();
   emitUses();
   emitInitialization();
   return true;
 }
 
-static FunctionCallee
-getOrInsertValueProfilingCall(Module &M, const TargetLibraryInfo &TLI,
-                              bool IsRange = false) {
+static FunctionCallee getOrInsertValueProfilingCall(
+    Module &M, const TargetLibraryInfo &TLI,
+    ValueProfilingCallType CallType = ValueProfilingCallType::Default) {
   LLVMContext &Ctx = M.getContext();
   auto *ReturnTy = Type::getVoidTy(M.getContext());
 
@@ -557,27 +616,19 @@ getOrInsertValueProfilingCall(Module &M, const TargetLibraryInfo &TLI,
   if (auto AK = TLI.getExtAttrForI32Param(false))
     AL = AL.addParamAttribute(M.getContext(), 2, AK);
 
-  if (!IsRange) {
-    Type *ParamTypes[] = {
+  assert((CallType == ValueProfilingCallType::Default ||
+          CallType == ValueProfilingCallType::MemOp) &&
+         "Must be Default or MemOp");
+  Type *ParamTypes[] = {
 #define VALUE_PROF_FUNC_PARAM(ParamType, ParamName, ParamLLVMType) ParamLLVMType
 #include "llvm/ProfileData/InstrProfData.inc"
-    };
-    auto *ValueProfilingCallTy =
-        FunctionType::get(ReturnTy, makeArrayRef(ParamTypes), false);
-    return M.getOrInsertFunction(getInstrProfValueProfFuncName(),
-                                 ValueProfilingCallTy, AL);
-  } else {
-    Type *RangeParamTypes[] = {
-#define VALUE_RANGE_PROF 1
-#define VALUE_PROF_FUNC_PARAM(ParamType, ParamName, ParamLLVMType) ParamLLVMType
-#include "llvm/ProfileData/InstrProfData.inc"
-#undef VALUE_RANGE_PROF
-    };
-    auto *ValueRangeProfilingCallTy =
-        FunctionType::get(ReturnTy, makeArrayRef(RangeParamTypes), false);
-    return M.getOrInsertFunction(getInstrProfValueRangeProfFuncName(),
-                                 ValueRangeProfilingCallTy, AL);
-  }
+  };
+  auto *ValueProfilingCallTy =
+      FunctionType::get(ReturnTy, makeArrayRef(ParamTypes), false);
+  StringRef FuncName = CallType == ValueProfilingCallType::Default
+                           ? getInstrProfValueProfFuncName()
+                           : getInstrProfValueProfMemOpFuncName();
+  return M.getOrInsertFunction(FuncName, ValueProfilingCallTy, AL);
 }
 
 void InstrProfiling::computeNumValueSiteCounts(InstrProfValueProfileInst *Ind) {
@@ -606,25 +657,30 @@ void InstrProfiling::lowerValueProfileInst(InstrProfValueProfileInst *Ind) {
     Index += It->second.NumValueSites[Kind];
 
   IRBuilder<> Builder(Ind);
-  bool IsRange = (Ind->getValueKind()->getZExtValue() ==
-                  llvm::InstrProfValueKind::IPVK_MemOPSize);
+  bool IsMemOpSize = (Ind->getValueKind()->getZExtValue() ==
+                      llvm::InstrProfValueKind::IPVK_MemOPSize);
   CallInst *Call = nullptr;
   auto *TLI = &GetTLI(*Ind->getFunction());
-  if (!IsRange) {
+
+  // To support value profiling calls within Windows exception handlers, funclet
+  // information contained within operand bundles needs to be copied over to
+  // the library call. This is required for the IR to be processed by the
+  // WinEHPrepare pass.
+  SmallVector<OperandBundleDef, 1> OpBundles;
+  Ind->getOperandBundlesAsDefs(OpBundles);
+  if (!IsMemOpSize) {
     Value *Args[3] = {Ind->getTargetValue(),
                       Builder.CreateBitCast(DataVar, Builder.getInt8PtrTy()),
                       Builder.getInt32(Index)};
-    Call = Builder.CreateCall(getOrInsertValueProfilingCall(*M, *TLI), Args);
+    Call = Builder.CreateCall(getOrInsertValueProfilingCall(*M, *TLI), Args,
+                              OpBundles);
   } else {
-    Value *Args[6] = {
-        Ind->getTargetValue(),
-        Builder.CreateBitCast(DataVar, Builder.getInt8PtrTy()),
-        Builder.getInt32(Index),
-        Builder.getInt64(MemOPSizeRangeStart),
-        Builder.getInt64(MemOPSizeRangeLast),
-        Builder.getInt64(MemOPSizeLarge == 0 ? INT64_MIN : MemOPSizeLarge)};
-    Call =
-        Builder.CreateCall(getOrInsertValueProfilingCall(*M, *TLI, true), Args);
+    Value *Args[3] = {Ind->getTargetValue(),
+                      Builder.CreateBitCast(DataVar, Builder.getInt8PtrTy()),
+                      Builder.getInt32(Index)};
+    Call = Builder.CreateCall(
+        getOrInsertValueProfilingCall(*M, *TLI, ValueProfilingCallType::MemOp),
+        Args, OpBundles);
   }
   if (auto AK = TLI->getExtAttrForI32Param(false))
     Call->addParamAttr(2, AK);
@@ -640,9 +696,40 @@ void InstrProfiling::lowerIncrement(InstrProfIncrementInst *Inc) {
   Value *Addr = Builder.CreateConstInBoundsGEP2_64(Counters->getValueType(),
                                                    Counters, 0, Index);
 
-  if (Options.Atomic || AtomicCounterUpdateAll) {
+  if (isRuntimeCounterRelocationEnabled()) {
+    Type *Int64Ty = Type::getInt64Ty(M->getContext());
+    Type *Int64PtrTy = Type::getInt64PtrTy(M->getContext());
+    Function *Fn = Inc->getParent()->getParent();
+    Instruction &I = Fn->getEntryBlock().front();
+    LoadInst *LI = dyn_cast<LoadInst>(&I);
+    if (!LI) {
+      IRBuilder<> Builder(&I);
+      GlobalVariable *Bias = M->getGlobalVariable(getInstrProfCounterBiasVarName());
+      if (!Bias) {
+        // Compiler must define this variable when runtime counter relocation
+        // is being used. Runtime has a weak external reference that is used
+        // to check whether that's the case or not.
+        Bias = new GlobalVariable(*M, Int64Ty, false, GlobalValue::LinkOnceODRLinkage,
+                                  Constant::getNullValue(Int64Ty),
+                                  getInstrProfCounterBiasVarName());
+        Bias->setVisibility(GlobalVariable::HiddenVisibility);
+        // A definition that's weak (linkonce_odr) without being in a COMDAT
+        // section wouldn't lead to link errors, but it would lead to a dead
+        // data word from every TU but one. Putting it in COMDAT ensures there
+        // will be exactly one data slot in the link.
+        if (TT.supportsCOMDAT())
+          Bias->setComdat(M->getOrInsertComdat(Bias->getName()));
+      }
+      LI = Builder.CreateLoad(Int64Ty, Bias);
+    }
+    auto *Add = Builder.CreateAdd(Builder.CreatePtrToInt(Addr, Int64Ty), LI);
+    Addr = Builder.CreateIntToPtr(Add, Int64PtrTy);
+  }
+
+  if (Options.Atomic || AtomicCounterUpdateAll ||
+      (Index == 0 && AtomicFirstCounter)) {
     Builder.CreateAtomicRMW(AtomicRMWInst::Add, Addr, Inc->getStep(),
-                            AtomicOrdering::Monotonic);
+                            MaybeAlign(), AtomicOrdering::Monotonic);
   } else {
     Value *IncStep = Inc->getStep();
     Value *Load = Builder.CreateLoad(IncStep->getType(), Addr, "pgocount");
@@ -686,7 +773,34 @@ static std::string getVarName(InstrProfIncrementInst *Inc, StringRef Prefix) {
   return (Prefix + Name + "." + Twine(FuncHash)).str();
 }
 
+static uint64_t getIntModuleFlagOrZero(const Module &M, StringRef Flag) {
+  auto *MD = dyn_cast_or_null<ConstantAsMetadata>(M.getModuleFlag(Flag));
+  if (!MD)
+    return 0;
+
+  // If the flag is a ConstantAsMetadata, it should be an integer representable
+  // in 64-bits.
+  return cast<ConstantInt>(MD->getValue())->getZExtValue();
+}
+
+static bool enablesValueProfiling(const Module &M) {
+  return isIRPGOFlagSet(&M) ||
+         getIntModuleFlagOrZero(M, "EnableValueProfiling") != 0;
+}
+
+// Conservatively returns true if data variables may be referenced by code.
+static bool profDataReferencedByCode(const Module &M) {
+  return enablesValueProfiling(M);
+}
+
 static inline bool shouldRecordFunctionAddr(Function *F) {
+  // Only record function addresses if IR PGO is enabled or if clang value
+  // profiling is enabled. Recording function addresses greatly increases object
+  // file size, because it prevents the inliner from deleting functions that
+  // have been inlined everywhere.
+  if (!profDataReferencedByCode(*F->getParent()))
+    return false;
+
   // Check the linkage
   bool HasAvailableExternallyLinkage = F->hasAvailableExternallyLinkage();
   if (!F->hasLinkOnceLinkage() && !F->hasLocalLinkage() &&
@@ -740,15 +854,10 @@ InstrProfiling::getOrCreateRegionCounters(InstrProfIncrementInst *Inc) {
     PD = It->second;
   }
 
-  // Match the linkage and visibility of the name global. COFF supports using
-  // comdats with internal symbols, so do that if we can.
+  // Match the linkage and visibility of the name global.
   Function *Fn = Inc->getParent()->getParent();
   GlobalValue::LinkageTypes Linkage = NamePtr->getLinkage();
   GlobalValue::VisibilityTypes Visibility = NamePtr->getVisibility();
-  if (TT.isOSBinFormatCOFF()) {
-    Linkage = GlobalValue::InternalLinkage;
-    Visibility = GlobalValue::DefaultVisibility;
-  }
 
   // Move the name variable to the right section. Place them in a COMDAT group
   // if the associated function is a COMDAT. This will make sure that only one
@@ -757,20 +866,31 @@ InstrProfiling::getOrCreateRegionCounters(InstrProfIncrementInst *Inc) {
   // new comdat group for the counters and profiling data. If we use the comdat
   // of the parent function, that will result in relocations against discarded
   // sections.
+  //
+  // If the data variable is referenced by code,  counters and data have to be
+  // in different comdats for COFF because the Visual C++ linker will report
+  // duplicate symbol errors if there are multiple external symbols with the
+  // same name marked IMAGE_COMDAT_SELECT_ASSOCIATIVE.
+  //
+  // For ELF, when not using COMDAT, put counters, data and values into a
+  // nodeduplicate COMDAT which is lowered to a zero-flag section group. This
+  // allows -z start-stop-gc to discard the entire group when the function is
+  // discarded.
+  bool DataReferencedByCode = profDataReferencedByCode(*M);
   bool NeedComdat = needsComdatForCounter(*Fn, *M);
-  if (NeedComdat) {
-    if (TT.isOSBinFormatCOFF()) {
-      // For COFF, put the counters, data, and values each into their own
-      // comdats. We can't use a group because the Visual C++ linker will
-      // report duplicate symbol errors if there are multiple external symbols
-      // with the same name marked IMAGE_COMDAT_SELECT_ASSOCIATIVE.
-      Linkage = GlobalValue::LinkOnceODRLinkage;
-      Visibility = GlobalValue::HiddenVisibility;
+  std::string CntsVarName = getVarName(Inc, getInstrProfCountersVarPrefix());
+  std::string DataVarName = getVarName(Inc, getInstrProfDataVarPrefix());
+  auto MaybeSetComdat = [&](GlobalVariable *GV) {
+    bool UseComdat = (NeedComdat || TT.isOSBinFormatELF());
+    if (UseComdat) {
+      StringRef GroupName = TT.isOSBinFormatCOFF() && DataReferencedByCode
+                                ? GV->getName()
+                                : CntsVarName;
+      Comdat *C = M->getOrInsertComdat(GroupName);
+      if (!NeedComdat)
+        C->setSelectionKind(Comdat::NoDeduplicate);
+      GV->setComdat(C);
     }
-  }
-  auto MaybeSetComdat = [=](GlobalVariable *GV) {
-    if (NeedComdat)
-      GV->setComdat(M->getOrInsertComdat(GV->getName()));
   };
 
   uint64_t NumCounters = Inc->getNumCounters()->getZExtValue();
@@ -780,8 +900,7 @@ InstrProfiling::getOrCreateRegionCounters(InstrProfIncrementInst *Inc) {
   // Create the counters variable.
   auto *CounterPtr =
       new GlobalVariable(*M, CounterTy, false, Linkage,
-                         Constant::getNullValue(CounterTy),
-                         getVarName(Inc, getInstrProfCountersVarPrefix()));
+                         Constant::getNullValue(CounterTy), CntsVarName);
   CounterPtr->setVisibility(Visibility);
   CounterPtr->setSection(
       getInstrProfSectionName(IPSK_cnts, TT.getObjectFormat()));
@@ -793,28 +912,26 @@ InstrProfiling::getOrCreateRegionCounters(InstrProfIncrementInst *Inc) {
   // Allocate statically the array of pointers to value profile nodes for
   // the current function.
   Constant *ValuesPtrExpr = ConstantPointerNull::get(Int8PtrTy);
-  if (ValueProfileStaticAlloc && !needsRuntimeRegistrationOfSectionRange(TT)) {
-    uint64_t NS = 0;
-    for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
-      NS += PD.NumValueSites[Kind];
-    if (NS) {
-      ArrayType *ValuesTy = ArrayType::get(Type::getInt64Ty(Ctx), NS);
-
-      auto *ValuesVar =
-          new GlobalVariable(*M, ValuesTy, false, Linkage,
-                             Constant::getNullValue(ValuesTy),
-                             getVarName(Inc, getInstrProfValuesVarPrefix()));
-      ValuesVar->setVisibility(Visibility);
-      ValuesVar->setSection(
-          getInstrProfSectionName(IPSK_vals, TT.getObjectFormat()));
-      ValuesVar->setAlignment(Align(8));
-      MaybeSetComdat(ValuesVar);
-      ValuesPtrExpr =
-          ConstantExpr::getBitCast(ValuesVar, Type::getInt8PtrTy(Ctx));
-    }
+  uint64_t NS = 0;
+  for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
+    NS += PD.NumValueSites[Kind];
+  if (NS > 0 && ValueProfileStaticAlloc &&
+      !needsRuntimeRegistrationOfSectionRange(TT)) {
+    ArrayType *ValuesTy = ArrayType::get(Type::getInt64Ty(Ctx), NS);
+    auto *ValuesVar = new GlobalVariable(
+        *M, ValuesTy, false, Linkage, Constant::getNullValue(ValuesTy),
+        getVarName(Inc, getInstrProfValuesVarPrefix()));
+    ValuesVar->setVisibility(Visibility);
+    ValuesVar->setSection(
+        getInstrProfSectionName(IPSK_vals, TT.getObjectFormat()));
+    ValuesVar->setAlignment(Align(8));
+    MaybeSetComdat(ValuesVar);
+    ValuesPtrExpr =
+        ConstantExpr::getBitCast(ValuesVar, Type::getInt8PtrTy(Ctx));
   }
 
   // Create data variable.
+  auto *IntPtrTy = M->getDataLayout().getIntPtrType(M->getContext());
   auto *Int16Ty = Type::getInt16Ty(Ctx);
   auto *Int16ArrayTy = ArrayType::get(Int16Ty, IPVK_Last + 1);
   Type *DataTypes[] = {
@@ -831,13 +948,32 @@ InstrProfiling::getOrCreateRegionCounters(InstrProfIncrementInst *Inc) {
   for (uint32_t Kind = IPVK_First; Kind <= IPVK_Last; ++Kind)
     Int16ArrayVals[Kind] = ConstantInt::get(Int16Ty, PD.NumValueSites[Kind]);
 
+  // If the data variable is not referenced by code (if we don't emit
+  // @llvm.instrprof.value.profile, NS will be 0), and the counter keeps the
+  // data variable live under linker GC, the data variable can be private. This
+  // optimization applies to ELF.
+  //
+  // On COFF, a comdat leader cannot be local so we require DataReferencedByCode
+  // to be false.
+  if (NS == 0 && (TT.isOSBinFormatELF() ||
+                  (!DataReferencedByCode && TT.isOSBinFormatCOFF()))) {
+    Linkage = GlobalValue::PrivateLinkage;
+    Visibility = GlobalValue::DefaultVisibility;
+  }
+  auto *Data =
+      new GlobalVariable(*M, DataTy, false, Linkage, nullptr, DataVarName);
+  // Reference the counter variable with a label difference (link-time
+  // constant).
+  auto *RelativeCounterPtr =
+      ConstantExpr::getSub(ConstantExpr::getPtrToInt(CounterPtr, IntPtrTy),
+                           ConstantExpr::getPtrToInt(Data, IntPtrTy));
+
   Constant *DataVals[] = {
 #define INSTR_PROF_DATA(Type, LLVMType, Name, Init) Init,
 #include "llvm/ProfileData/InstrProfData.inc"
   };
-  auto *Data = new GlobalVariable(*M, DataTy, false, Linkage,
-                                  ConstantStruct::get(DataTy, DataVals),
-                                  getVarName(Inc, getInstrProfDataVarPrefix()));
+  Data->setInitializer(ConstantStruct::get(DataTy, DataVals));
+
   Data->setVisibility(Visibility);
   Data->setSection(getInstrProfSectionName(IPSK_data, TT.getObjectFormat()));
   Data->setAlignment(Align(INSTR_PROF_DATA_ALIGNMENT));
@@ -849,7 +985,7 @@ InstrProfiling::getOrCreateRegionCounters(InstrProfIncrementInst *Inc) {
   ProfileDataMap[NamePtr] = PD;
 
   // Mark the data variable as used so that it isn't stripped out.
-  UsedVars.push_back(Data);
+  CompilerUsedVars.push_back(Data);
   // Now that the linkage set by the FE has been passed to the data and counter
   // variables, reset Name variable's linkage and visibility to private so that
   // it can be removed later by the compiler.
@@ -904,6 +1040,8 @@ void InstrProfiling::emitVNodes() {
       Constant::getNullValue(VNodesTy), getInstrProfVNodesVarName());
   VNodesVar->setSection(
       getInstrProfSectionName(IPSK_vnodes, TT.getObjectFormat()));
+  // VNodesVar is used by runtime but not referenced via relocation by other
+  // sections. Conservatively make it linker retained.
   UsedVars.push_back(VNodesVar);
 }
 
@@ -915,7 +1053,7 @@ void InstrProfiling::emitNameData() {
 
   std::string CompressedNameStr;
   if (Error E = collectPGOFuncNameStrings(ReferencedNames, CompressedNameStr,
-                                          DoNameCompression)) {
+                                          DoInstrProfNameCompression)) {
     report_fatal_error(toString(std::move(E)), false);
   }
 
@@ -931,7 +1069,9 @@ void InstrProfiling::emitNameData() {
   // On COFF, it's important to reduce the alignment down to 1 to prevent the
   // linker from inserting padding before the start of the names section or
   // between names entries.
-  NamesVar->setAlignment(Align::None());
+  NamesVar->setAlignment(Align(1));
+  // NamesVar is used by runtime but not referenced via relocation by other
+  // sections. Conservatively make it linker retained.
   UsedVars.push_back(NamesVar);
 
   for (auto *NamePtr : ReferencedNames)
@@ -959,6 +1099,9 @@ void InstrProfiling::emitRegistration() {
                        getInstrProfRegFuncName(), M);
 
   IRBuilder<> IRB(BasicBlock::Create(M->getContext(), "", RegisterF));
+  for (Value *Data : CompilerUsedVars)
+    if (!isa<Function>(Data))
+      IRB.CreateCall(RuntimeRegisterF, IRB.CreateBitCast(Data, VoidPtrTy));
   for (Value *Data : UsedVars)
     if (Data != NamesVar && !isa<Function>(Data))
       IRB.CreateCall(RuntimeRegisterF, IRB.CreateBitCast(Data, VoidPtrTy));
@@ -978,8 +1121,8 @@ void InstrProfiling::emitRegistration() {
 }
 
 bool InstrProfiling::emitRuntimeHook() {
-  // We expect the linker to be invoked with -u<hook_var> flag for linux,
-  // for which case there is no need to emit the user function.
+  // We expect the linker to be invoked with -u<hook_var> flag for Linux
+  // in which case there is no need to emit the external variable.
   if (TT.isOSLinux())
     return false;
 
@@ -993,29 +1136,51 @@ bool InstrProfiling::emitRuntimeHook() {
       new GlobalVariable(*M, Int32Ty, false, GlobalValue::ExternalLinkage,
                          nullptr, getInstrProfRuntimeHookVarName());
 
-  // Make a function that uses it.
-  auto *User = Function::Create(FunctionType::get(Int32Ty, false),
-                                GlobalValue::LinkOnceODRLinkage,
-                                getInstrProfRuntimeHookVarUseFuncName(), M);
-  User->addFnAttr(Attribute::NoInline);
-  if (Options.NoRedZone)
-    User->addFnAttr(Attribute::NoRedZone);
-  User->setVisibility(GlobalValue::HiddenVisibility);
-  if (TT.supportsCOMDAT())
-    User->setComdat(M->getOrInsertComdat(User->getName()));
+  if (TT.isOSBinFormatELF()) {
+    // Mark the user variable as used so that it isn't stripped out.
+    CompilerUsedVars.push_back(Var);
+  } else {
+    // Make a function that uses it.
+    auto *User = Function::Create(FunctionType::get(Int32Ty, false),
+                                  GlobalValue::LinkOnceODRLinkage,
+                                  getInstrProfRuntimeHookVarUseFuncName(), M);
+    User->addFnAttr(Attribute::NoInline);
+    if (Options.NoRedZone)
+      User->addFnAttr(Attribute::NoRedZone);
+    User->setVisibility(GlobalValue::HiddenVisibility);
+    if (TT.supportsCOMDAT())
+      User->setComdat(M->getOrInsertComdat(User->getName()));
 
-  IRBuilder<> IRB(BasicBlock::Create(M->getContext(), "", User));
-  auto *Load = IRB.CreateLoad(Int32Ty, Var);
-  IRB.CreateRet(Load);
+    IRBuilder<> IRB(BasicBlock::Create(M->getContext(), "", User));
+    auto *Load = IRB.CreateLoad(Int32Ty, Var);
+    IRB.CreateRet(Load);
 
-  // Mark the user variable as used so that it isn't stripped out.
-  UsedVars.push_back(User);
+    // Mark the function as used so that it isn't stripped out.
+    CompilerUsedVars.push_back(User);
+  }
   return true;
 }
 
 void InstrProfiling::emitUses() {
-  if (!UsedVars.empty())
-    appendToUsed(*M, UsedVars);
+  // The metadata sections are parallel arrays. Optimizers (e.g.
+  // GlobalOpt/ConstantMerge) may not discard associated sections as a unit, so
+  // we conservatively retain all unconditionally in the compiler.
+  //
+  // On ELF, the linker can guarantee the associated sections will be retained
+  // or discarded as a unit, so llvm.compiler.used is sufficient. Similarly on
+  // COFF, if prof data is not referenced by code we use one comdat and ensure
+  // this GC property as well. Otherwise, we have to conservatively make all of
+  // the sections retained by the linker.
+  if (TT.isOSBinFormatELF() ||
+      (TT.isOSBinFormatCOFF() && !profDataReferencedByCode(*M)))
+    appendToCompilerUsed(*M, CompilerUsedVars);
+  else
+    appendToUsed(*M, CompilerUsedVars);
+
+  // We do not add proper references from used metadata sections to NamesVar and
+  // VNodesVar, so we have to be conservative and place them in llvm.used
+  // regardless of the target,
+  appendToUsed(*M, UsedVars);
 }
 
 void InstrProfiling::emitInitialization() {
