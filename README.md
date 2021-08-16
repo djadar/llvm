@@ -11,7 +11,7 @@ cd build/
 
 cmake ../
 
-# To refister a pass
+# To register or compile a pass
 
 cmake --build .
 
